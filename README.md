@@ -38,36 +38,59 @@ Prerequisite for both options: a host user `deploy` that is in the `docker` grou
 
 ### Option A: Docker + Traefik (recommended)
 
-```bash
-# 1. Put this folder OUTSIDE ALLOWED_ROOT (see notes)
-git clone <this repo> /opt/ngeupdate   # or scp the folder
-cd /opt/ngeupdate
+The image is built by GitHub Actions and published to `ghcr.io/harizinside/ngeupdate`. The VPS only needs three files — no `git clone`, no build toolchain.
 
-# 2. Server config
-cp ngeupdate.env.example ngeupdate.env
+```bash
+# Run this OUTSIDE ALLOWED_ROOT (ngeupdate must not live under /srv/apps,
+# otherwise `up -d --force-recreate` on self-deploy kills the container
+# that's serving the request).
+mkdir -p /opt/ngeupdate && cd /opt/ngeupdate
+base=https://raw.githubusercontent.com/harizinside/ngeupdate/main
+curl -fsSLO $base/docker-compose.yaml
+curl -fsSL $base/.env.example -o .env
+curl -fsSL $base/ngeupdate.env.example -o ngeupdate.env
+
+# Server config: bearer key
 sed -i "s/^NGEUPDATE_KEY=.*/NGEUPDATE_KEY=$(openssl rand -hex 32)/" ngeupdate.env
 chmod 600 ngeupdate.env
 
-# 3. uid/gid for the container
-cp .env.example .env
+# uid/gid for the container (same as before)
 id deploy                                 # -> DEPLOY_UID / DEPLOY_GID
 getent group docker | cut -d: -f3         # -> DOCKER_GID
 vi .env
 
-# 4. Edit Traefik labels in docker-compose.yaml: Host(`...`), entrypoints,
-#    certresolver and the external network name must match your Traefik setup.
+# Edit Traefik labels in docker-compose.yaml: Host(`...`), entrypoints,
+# certresolver and the external network name must match your Traefik setup.
+# This file is local: re-downloading overwrites your Traefik edits, so
+# don't re-run the curl above on update (see "Update" below).
 
-# 5. Start
-docker compose up -d --build
+# Start
+docker compose pull && docker compose up -d
 docker compose logs -f
 
-# 6. Sanity checks
-docker compose exec ngeupdate docker compose version
-docker compose exec ngeupdate git -C /srv/apps/myapp pull     # must work without prompts
+# Sanity checks
+docker compose exec ngeupdate docker compose version          # docker.sock works
+docker compose exec ngeupdate git -C /srv/apps/myapp pull     # SSH git works, no prompts
 curl -s -o /dev/null -w '%{http_code}\n' -X POST https://deploy.example.com/mcp   # 401
 ```
 
-Upgrade later: `git pull && docker compose up -d --build` in `/opt/ngeupdate` (run it by hand, not through the tool).
+**Update.** `docker compose pull && docker compose up -d` in `/opt/ngeupdate`. Run it by hand — never through the `deploy` tool, because ngeupdate would have to recreate itself. The `docker-compose.yaml` you downloaded has your Traefik edits baked in, so don't re-download it on update; only the image changes.
+
+**Rollback.** Set `NGEUPDATE_TAG=sha-1a2b3c4` in `/opt/ngeupdate/.env`, then `docker compose pull && docker compose up -d`. Every CI run pushes a `sha-<short>` tag (see workflow), so any past build is one line away.
+
+**Release a versioned tag.** `git tag v1.0.0 && git push --tags` from anywhere with push access to the repo. The CI workflow then publishes `1.0.0`, `1.0`, and the matching `sha-` build (in addition to `latest`, which only tracks `main`).
+
+**Build locally instead of pulling.** `docker build -t ghcr.io/harizinside/ngeupdate:dev .`, then `NGEUPDATE_TAG=dev docker compose up -d` in `/opt/ngeupdate`.
+
+**Package visibility.** New GHCR packages are private by default, even when the repo is public. Two options:
+
+- *Recommended:* GitHub → Packages → `ngeupdate` → Package settings → Change visibility → Public. The image contains only `server.py`; secrets come from `ngeupdate.env` on the VPS. With the package public, the VPS needs no `docker login`.
+- *Stay private:* one-time on the VPS:
+  ```bash
+  docker login ghcr.io -u harizinside
+  # PAT (classic) with scope: read:packages
+  ```
+  Docker stores the PAT in `~/.docker/config.json` of the host user that runs `docker` (base64, **not** encrypted) and keeps using it until the PAT expires. Give the PAT an expiry and only the `read:packages` scope, and re-run `docker login` when it expires.
 
 Why the compose file looks the way it does:
 

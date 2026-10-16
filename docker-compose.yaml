@@ -1,6 +1,6 @@
 services:
   ngeupdate:
-    build: .
+    image: ghcr.io/harizinside/ngeupdate:${NGEUPDATE_TAG:-latest}
     restart: unless-stopped
     env_file: ngeupdate.env              # NGEUPDATE_KEY, ALLOWED_ROOT, DEPLOY_TIMEOUT, HEALTH_TIMEOUT
     user: "${DEPLOY_UID}:${DEPLOY_GID}"  # run as host user 'deploy' so git-pulled files keep its ownership
