@@ -1,0 +1,64 @@
+services:
+  ngeupdate:
+    build: .
+    restart: unless-stopped
+    env_file: ngeupdate.env              # NGEUPDATE_KEY, ALLOWED_ROOT, DEPLOY_TIMEOUT, HEALTH_TIMEOUT
+    user: "${DEPLOY_UID}:${DEPLOY_GID}"  # run as host user 'deploy' so git-pulled files keep its ownership
+    group_add: ["${DOCKER_GID}"]         # access to docker.sock
+    environment:
+      HOME: /home/deploy
+    # Container hardening. docker.sock is still root-equivalent on the host;
+    # these just shrink what a bug in server.py itself could do.
+    read_only: true
+    tmpfs: [/tmp, /home/deploy/.docker]   # docker/buildx CLI writes state here
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 512
+    mem_limit: 512m
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /srv/apps:/srv/apps              # MUST be the same path as on the host (= ALLOWED_ROOT)
+      - /home/deploy/.ssh:/home/deploy/.ssh:ro
+      - /home/deploy/.gitconfig:/home/deploy/.gitconfig:ro
+      - /etc/passwd:/etc/passwd:ro       # ssh refuses to run for a uid without a passwd entry
+      - /etc/group:/etc/group:ro
+    networks: [traefik]
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=traefik
+      - traefik.http.routers.ngeupdate.rule=Host(`deploy.example.com`)
+      - traefik.http.routers.ngeupdate.entrypoints=websecure
+      - traefik.http.routers.ngeupdate.tls.certresolver=letsencrypt
+      - traefik.http.services.ngeupdate.loadbalancer.server.port=8787
+      # Edge protection. Order matters: ngeupdate-cf FIRST so anyone bypassing
+      # Cloudflare gets 403 before we even count their requests.
+      - traefik.http.routers.ngeupdate.middlewares=ngeupdate-cf,ngeupdate-ratelimit,ngeupdate-inflight,ngeupdate-body
+
+      # Origin lock — only Cloudflare IPs reach this router. Anyone hitting
+      # the VPS IP directly gets 403 at the edge.
+      # Source: https://www.cloudflare.com/ips/  (re-check yearly)
+      # Traefik < 2.10 used `ipwhitelist`; current is `ipallowlist`.
+      - traefik.http.middlewares.ngeupdate-cf.ipallowlist.sourcerange=173.245.48.0/20,103.21.244.0/22,103.22.200.0/22,103.31.4.0/22,141.101.64.0/18,108.162.192.0/18,190.93.240.0/20,188.114.96.0/20,197.234.240.0/22,198.41.128.0/17,162.158.0.0/15,104.16.0.0/13,104.24.0.0/14,172.64.0.0/13,131.0.72.0/22,2400:cb00::/32,2606:4700::/32,2803:f800::/32,2405:b500::/32,2405:8100::/32,2a06:98c0::/29,2c0f:f248::/32
+
+      # ~30 req/min per client IP, bursts of 20 (one MCP connect is ~4 requests)
+      # sourcecriterion on CF-Connecting-IP — safe BECAUSE ngeupdate-cf already
+      # guarantees only Cloudflare reached the router.
+      - traefik.http.middlewares.ngeupdate-ratelimit.ratelimit.average=30
+      - traefik.http.middlewares.ngeupdate-ratelimit.ratelimit.period=1m
+      - traefik.http.middlewares.ngeupdate-ratelimit.ratelimit.burst=20
+      - traefik.http.middlewares.ngeupdate-ratelimit.ratelimit.sourcecriterion.requestheadername=CF-Connecting-IP
+
+      # at most 10 open requests per client IP
+      - traefik.http.middlewares.ngeupdate-inflight.inflightreq.amount=10
+      - traefik.http.middlewares.ngeupdate-inflight.inflightreq.sourcecriterion.requestheadername=CF-Connecting-IP
+
+      # reject bodies > 1 MiB at the edge
+      - traefik.http.middlewares.ngeupdate-body.buffering.maxRequestBodyBytes=1048576
+
+      # Optional, strongest: only office/VPN IPs. Add `,ngeupdate-ips` to the
+      # middlewares list above. (Traefik < v2.10: use `ipwhitelist`.)
+      # - traefik.http.middlewares.ngeupdate-ips.ipallowlist.sourcerange=203.0.113.10/32,10.8.0.0/24
+
+networks:
+  traefik:
+    external: true
