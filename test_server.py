@@ -820,6 +820,10 @@ class NoticeEndToEndTests(unittest.TestCase):
             base = os.path.realpath(base)
             remote = os.path.join(base, "remote.git")
             self._git("init", "--bare", remote, cwd=base)
+            # Bare HEAD must point at main too, or `git clone` (below, for
+            # `work`) checks out a nonexistent master on hosts whose default
+            # branch is master (e.g. GitHub's Ubuntu runner).
+            self._git("symbolic-ref", "HEAD", "refs/heads/main", cwd=remote)
             self._git("clone", remote, "clone", cwd=base)
             clone = os.path.join(base, "clone")
             # Modern git defaults to `main`; force it explicitly so the test
