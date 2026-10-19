@@ -2,5 +2,6 @@
 FROM docker:27-cli
 RUN apk add --no-cache python3 git openssh-client
 COPY server.py /app/server.py
+COPY ngeupdate /app/ngeupdate
 ENV HOST=0.0.0.0 PYTHONUNBUFFERED=1
 CMD ["python3", "/app/server.py"]

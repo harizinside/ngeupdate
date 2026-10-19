@@ -21,10 +21,11 @@ docker compose up -d [--force-recreate]      # clean mode only adds --force-recr
 
 ## Layout
 
-| File | Purpose |
+| Path | Purpose |
 | --- | --- |
-| `server.py` | The MCP server (stdlib only). |
-| `test_server.py` | Unit + HTTP smoke tests, run with `python3 -m unittest`. |
+| `server.py` | 3-line shim — `from ngeupdate.__main__ import main; main()`. Kept so the systemd unit + Dockerfile's `CMD ["python3", "/app/server.py"]` keep working. |
+| `ngeupdate/` | The MCP server package (stdlib only). Modules: `config`, `tokens`, `project`, `deploy`, `health`, `jobs`, `oauth`, `mcp`, `handler`, `__main__`. |
+| `tests/` | Unit + HTTP smoke tests, run with `uv run python -m unittest`. Mirrors the package split. |
 | `Dockerfile`, `docker-compose.yaml` | Option A: container behind Traefik. |
 | `.env.example` | uid/gid values for `docker-compose.yaml` (copy to `.env`). |
 | `ngeupdate.service` | Option B: systemd unit (`/etc/systemd/system/`). |
@@ -84,7 +85,7 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST https://deploy.example.com/mcp 
 
 **Package visibility.** New GHCR packages are private by default, even when the repo is public. Two options:
 
-- *Recommended:* GitHub → Packages → `ngeupdate` → Package settings → Change visibility → Public. The image contains only `server.py`; secrets come from `ngeupdate.env` on the VPS. With the package public, the VPS needs no `docker login`.
+- *Recommended:* GitHub → Packages → `ngeupdate` → Package settings → Change visibility → Public. The image contains only `server.py` + `ngeupdate/`; secrets come from `ngeupdate.env` on the VPS. With the package public, the VPS needs no `docker login`.
 - *Stay private:* one-time on the VPS:
   ```bash
   docker login ghcr.io -u harizinside
@@ -104,11 +105,12 @@ Why the compose file looks the way it does:
 ### Option B: systemd on the host (needs `python3` on the host)
 
 ```bash
-scp server.py ngeupdate.service ngeupdate.env.example user@vps:/tmp/
+scp -r server.py ngeupdate ngeupdate.service ngeupdate.env.example user@vps:/tmp/
 
 # on the VPS
 sudo mkdir -p /opt/ngeupdate
 sudo mv /tmp/server.py /opt/ngeupdate/
+sudo mv /tmp/ngeupdate /opt/ngeupdate/
 sudo mv /tmp/ngeupdate.service /etc/systemd/system/
 sudo mv /tmp/ngeupdate.env.example /etc/ngeupdate.env
 sudo sed -i "s/^NGEUPDATE_KEY=.*/NGEUPDATE_KEY=$(openssl rand -hex 32)/" /etc/ngeupdate.env
@@ -123,18 +125,24 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:8787/mcp   # 4
 
 The service listens on `127.0.0.1:8787`. To expose it through Traefik, add a file-provider route to `http://<host-ip>:8787` (and set `HOST` so Traefik can reach it), or just use Option A.
 
-Upgrade later: `scp` the new `server.py`, then `sudo systemctl restart ngeupdate`.
+Upgrade later:
+
+```bash
+scp -r server.py ngeupdate user@vps:/tmp/
+
+# on the VPS — drop the old package first, or `mv` nests it as
+# /opt/ngeupdate/ngeupdate/ngeupdate and the old code keeps running.
+# Leave /etc/ngeupdate.env alone: a new key revokes every teammate's token.
+sudo rm -rf /opt/ngeupdate/ngeupdate
+sudo mv /tmp/server.py /tmp/ngeupdate /opt/ngeupdate/
+sudo systemctl restart ngeupdate
+```
 
 ## How the team uses it
 
-1. Admin hands out the bearer key over a secure channel (password manager). Never paste it in chat.
-2. Each teammate sets it once, e.g. in `~/.zshrc`:
+1. Admin hands out the bearer key over a secure channel (password manager). Never paste it in chat. The key is typed **once** into the browser login page below — the agent then stores a 90-day OAuth token and never asks again.
 
-   ```sh
-   export NGEUPDATE_KEY=...
-   ```
-
-3. At the root of each project, add (or merge) `.mcp.json`:
+2. At the root of each project, add (or merge) `.mcp.json`:
 
    ```json
    {
@@ -143,7 +151,6 @@ Upgrade later: `scp` the new `server.py`, then `sudo systemctl restart ngeupdate
          "type": "http",
          "url": "https://deploy.example.com/mcp",
          "headers": {
-           "Authorization": "Bearer ${NGEUPDATE_KEY}",
            "X-Project-Path": "/srv/apps/myapp"
          }
        }
@@ -151,11 +158,11 @@ Upgrade later: `scp` the new `server.py`, then `sudo systemctl restart ngeupdate
    }
    ```
 
-   Safe to commit — the key stays in each teammate's env.
+   No secrets here — safe to commit.
 
-4. Open Claude Code in that repo. Approve the `ngeupdate` MCP server once. Verify with `/mcp` (status should be `connected`).
+3. Open Claude Code (or omp) in that repo. On first connect, the agent opens a browser page on `https://deploy.example.com/authorize`. Paste the key, sign in. Approve the `ngeupdate` MCP server once. Verify with `/mcp` (status should be `connected`).
 
-5. Just talk:
+4. Just talk:
 
    | You say | Mode |
    | --- | --- |
@@ -220,7 +227,6 @@ Validation runs **before `git pull`**: if a flag is requested but the matching h
       "type": "http",
       "url": "https://deploy.example.com/mcp",
       "headers": {
-        "Authorization": "Bearer ${NGEUPDATE_KEY}",
         "X-Project-Path": "/srv/apps/myapp",
         "X-Compose-Service": "app",
         "X-Migrate-Cmd": "php artisan migrate --force",
@@ -313,7 +319,10 @@ or `❌ FAILED ...`) plus any `⚠️` / `ℹ️` notice lines that follow.
 
 ## Security model (short version)
 
-- `Authorization: Bearer <key>` is checked with `hmac.compare_digest` before the body is parsed. Wrong / missing key → `401`.
+- Auth is the standard MCP OAuth flow. The agent opens a browser on `https://deploy.example.com/authorize` once, you paste the key, and the server hands back a 90-day bearer token. The raw `NGEUPDATE_KEY` is **never** accepted as a Bearer on `/mcp` — typed only into the browser, signed with HMAC, exchanged for a token, and the token is what every request uses afterwards.
+- Tokens are stateless: `b64url(json({kind, exp})).b64url(hmac_sha256(sig_key, json))`, where `sig_key = HMAC-SHA256(NGEUPDATE_KEY, "ngeupdate-oauth-v1")`. No database, no persistence. Rotating `NGEUPDATE_KEY` invalidates every outstanding token instantly (the HMAC key changes). New tokens re-issued at the cost of one more browser login.
+- PKCE (RFC 7636) is required (`S256` only). The authorisation code is bound to the exact `redirect_uri` it was minted for; loopback-only (127.0.0.1 / localhost / ::1) so a stolen code can't be redirected anywhere useful.
+- On 401 from `/mcp` the server sets `WWW-Authenticate: Bearer resource_metadata="..."` per RFC 9728 — that's how agents discover the OAuth endpoints. No `Authorization` header in `.mcp.json` means no secret to leak or rotate on every teammate.
 - The server refuses to start without `NGEUPDATE_KEY`.
 - `subprocess.run([...], shell=False, cwd=project_path, timeout=...)` — tool arguments are only ever the cwd. The only header-supplied argv is `X-Migrate-Cmd` / `X-Seed-Cmd`, and it runs inside the app container (see below).
 - `NGEUPDATE_KEY` is stripped from the env of every child process (git, docker compose).
@@ -392,21 +401,33 @@ The bearer key now also lets its holder run **any** command declared in `X-Migra
 
 ## Run tests locally
 
+The repo has a `.python-version` (3.12, same as CI). `uv run` picks it up
+without a `pyproject.toml`; the project stays stdlib-only with no
+dependencies. The VPS still runs on `python3` — that's Option B and the
+Alpine image. Use `uv run` only on this Mac / any other dev box.
+
 ```bash
-python3 -m unittest -v
+uv run python -m unittest -v
 ```
 
 Manual smoke run (in a temporary tree):
 
 ```bash
 mkdir -p /tmp/ngeupdate-test/myapp && touch /tmp/ngeupdate-test/myapp/compose.yaml
-NGEUPDATE_KEY=devkey ALLOWED_ROOT=/tmp/ngeupdate-test python3 server.py
+export KEY=$(openssl rand -hex 32)
+NGEUPDATE_KEY=$KEY ALLOWED_ROOT=/tmp/ngeupdate-test uv run python server.py
 
-# in another shell
-curl -s -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:8787/mcp   # 401
+# in another shell — first mint an access token the server will accept:
+TOKEN=$(NGEUPDATE_KEY=$KEY uv run python -c 'import os, ngeupdate.tokens as t, time; print(t._sign({"kind":"at","exp":time.time()+3600}, os.environ["NGEUPDATE_KEY"]))')
+
+# 401: no auth header
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:8787/mcp
+# 401: raw key no longer works on /mcp; it must be exchanged at /authorize first
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:8787/mcp \
+  -H "Authorization: Bearer $KEY"
 
 curl -s -X POST http://127.0.0.1:8787/mcp \
-  -H "Authorization: Bearer devkey" \
+  -H "Authorization: Bearer $TOKEN" \
   -H "X-Project-Path: /tmp/ngeupdate-test/myapp" \
   -H "Content-Type: application/json" \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
@@ -417,7 +438,7 @@ End-to-end async smoke test (deploy → deploy_status loop → final FAILED beca
 ```bash
 # returns a job id in ~ms
 curl -s -X POST http://127.0.0.1:8787/mcp \
-  -H "Authorization: Bearer devkey" \
+  -H "Authorization: Bearer $TOKEN" \
   -H "X-Project-Path: /tmp/ngeupdate-test/myapp" \
   -H "Content-Type: application/json" \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/call",
@@ -425,11 +446,43 @@ curl -s -X POST http://127.0.0.1:8787/mcp \
 
 # poll until final output
 curl -s -X POST http://127.0.0.1:8787/mcp \
-  -H "Authorization: Bearer devkey" \
+  -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"jsonrpc":"2.0","id":2,"method":"tools/call",
        "params":{"name":"deploy_status","arguments":{"job_id":"<paste id here>"}}}'
 ```
+
+## Other agents
+
+Claude Code and omp use the snippet in [Section 2](#how-the-team-uses-it) verbatim. Other MCP clients need a slightly different config but the URL + `X-*` headers are the same — the OAuth flow is automatic.
+
+**OpenCode.** Drop this in `opencode.json` (project root or `~/.config/opencode/opencode.json`):
+
+```jsonc
+{
+  "mcp": {
+    "ngeupdate": {
+      "type": "remote",
+      "url": "https://deploy.example.com/mcp",
+      "headers": {
+        "X-Project-Path": "/srv/apps/myapp"
+      }
+    }
+  }
+}
+```
+
+First connect: `opencode mcp auth ngeupdate`. The CLI opens the same `/authorize` page in your browser.
+
+**Codex (CLI).** In `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.ngeupdate]
+url = "https://deploy.example.com/mcp"
+http_headers = { "X-Project-Path" = "/srv/apps/myapp" }
+```
+
+First connect: `codex mcp login ngeupdate`.
 
 ## Not yet (planned)
 
