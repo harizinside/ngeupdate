@@ -10,7 +10,8 @@ services:
     # Container hardening. docker.sock is still root-equivalent on the host;
     # these just shrink what a bug in server.py itself could do.
     read_only: true
-    tmpfs: [/tmp, /home/deploy/.docker]   # docker/buildx CLI writes state here
+    # docker/buildx CLI writes state in ~/.docker; a bare tmpfs there is root-owned.
+    tmpfs: [/tmp, "/home/deploy/.docker:uid=${DEPLOY_UID},gid=${DEPLOY_GID}"]
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
     pids_limit: 512
